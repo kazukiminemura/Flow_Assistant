@@ -6,12 +6,14 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
+from shutil import which
 
 try:  # pragma: no cover - optional dependency
     import openvino.runtime as ov  # type: ignore
@@ -24,6 +26,8 @@ except ModuleNotFoundError:  # pragma: no cover - optional dependency
     Image = None  # type: ignore
 
 logger = logging.getLogger(__name__)
+
+_DEBUG_OCR_OUTPUT = os.getenv("FLOW_ASSISTANT_OCR_DEBUG", "").strip().lower() in {"1", "true", "yes"}
 
 _DEFAULT_ALPHABET = os.getenv(
     "FLOW_ASSISTANT_OCR_ALPHABET",
@@ -104,6 +108,8 @@ class OpenVINOTextRecognizer:
         bin_path = model_path.with_suffix(".bin")
         if xml_path.exists() and bin_path.exists():
             return
+        if _download_with_omz(xml_path):
+            return
         xml_url = _DEFAULT_MODEL_URLS["xml"]
         bin_url = _DEFAULT_MODEL_URLS["bin"]
         if not xml_url or not bin_url:
@@ -172,6 +178,47 @@ _PIPELINE: Optional[OpenVINOTextRecognizer] = None
 _PIPELINE_FAILED = False
 
 
+def _download_with_omz(model_path: Path) -> bool:
+    downloader = which("omz_downloader")
+    if not downloader:
+        return False
+    precision = os.getenv("FLOW_ASSISTANT_OCR_MODEL_PRECISION", "FP16")
+    model_name = os.getenv("FLOW_ASSISTANT_OCR_MODEL_NAME", "text-recognition-0014")
+    output_root = model_path.parent
+    command = [
+        downloader,
+        "--name",
+        model_name,
+        "--precision",
+        precision,
+        "--output_dir",
+        str(output_root),
+    ]
+    logger.info("Running omz_downloader to fetch %s", model_name)
+    try:
+        subprocess.run(command, check=True, capture_output=True, text=True)
+    except FileNotFoundError:
+        return False
+    except subprocess.CalledProcessError as exc:  # pragma: no cover - runtime safeguard
+        logger.warning("omz_downloader failed: %s", exc.stderr.strip())
+        return False
+    xml_candidate = next((c for c in output_root.rglob(f"{model_name}.xml")), None)
+    if not xml_candidate:
+        logger.warning("omz_downloader did not produce expected IR files")
+        return False
+    bin_candidate = xml_candidate.with_suffix(".bin")
+    if not bin_candidate.exists():
+        logger.warning("omz_downloader result missing BIN file")
+        return False
+    target_xml = model_path
+    target_bin = model_path.with_suffix(".bin")
+    target_xml.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(xml_candidate, target_xml)
+    shutil.copy2(bin_candidate, target_bin)
+    logger.info("Copied OpenVINO OCR model to %s", target_xml)
+    return True
+
+
 def _download_file(url: str, destination: Path) -> None:
     logger.info("Downloading OpenVINO OCR model from %s", url)
     with urllib.request.urlopen(url) as response:
@@ -184,7 +231,9 @@ def _download_file(url: str, destination: Path) -> None:
     if destination.suffix.lower() == ".xml":
         snippet = data.lstrip()[:64]
         if not snippet.startswith(b"<?xml"):
-            raise RuntimeError("Downloaded XML does not appear to be valid IR; received HTML/other content")
+            raise RuntimeError(
+                "Downloaded XML does not appear to be valid IR; received HTML/other content"
+            )
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_bytes(data)
 
@@ -212,7 +261,13 @@ def extract_text(image) -> str:
     if pipeline is None:
         return ""
     try:
-        return pipeline.run(image)
+        text = pipeline.run(image)
+        if _DEBUG_OCR_OUTPUT:
+            separator = "-" * 40
+            print("[OCR DEBUG]", separator)
+            print(text)
+            print(separator)
+        return text
     except Exception as exc:  # pragma: no cover - runtime safeguard
         logger.debug("OpenVINO OCR inference failed: %s", exc)
         return ""
