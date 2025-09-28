@@ -69,6 +69,16 @@ class OpenVinoOCRConfig:
         return cls(recognition_model=recognition_model)
 
 
+def _normalize_grayscale(image: "Image.Image") -> "Image.Image":
+    gray = ImageOps.autocontrast(image.convert("L"))
+    arr = np.asarray(gray, dtype=np.float32)
+    if arr.size == 0:
+        return gray
+    if arr.mean() < 128.0:
+        return ImageOps.invert(gray)
+    return gray
+
+
 class OpenVINOTextRecognizer:
     """Thin wrapper around an OpenVINO text recognition network."""
 
@@ -135,30 +145,30 @@ class OpenVINOTextRecognizer:
         logits = outputs[self._output]
         return self._decode(logits).strip()
 
-
-def _prepare_input(self, image: "Image.Image") -> np.ndarray:
-    image = image.convert("L") if self._channels == 1 else image.convert("RGB")
-    width, height = image.size
-    if width == 0 or height == 0:
-        width, height = self._target_width, self._target_height
-    scale = self._target_height / height
-    new_width = max(1, int(round(width * scale)))
-    if new_width > self._target_width:
-        new_width = self._target_width
-    resized = image.resize((new_width, self._target_height), Image.BICUBIC)
-    if self._channels == 1:
-        canvas = Image.new("L", (self._target_width, self._target_height), color=255)
-    else:
-        canvas = Image.new("RGB", (self._target_width, self._target_height), color=(255, 255, 255))
-    canvas.paste(resized, (0, 0))
-    array = np.asarray(canvas, dtype=np.float32)
-    if self._channels == 1:
-        array = array[np.newaxis, :, :]
-    else:
-        array = np.transpose(array, (2, 0, 1))  # HWC -> CHW
-    array = array / 255.0
-    array = array[np.newaxis, ...]  # add batch dimension
-    return array
+    def _prepare_input(self, image: "Image.Image") -> np.ndarray:
+        base_gray = _normalize_grayscale(image)
+        normalized = base_gray if self._channels == 1 else base_gray.convert("RGB")
+        width, height = normalized.size
+        if width == 0 or height == 0:
+            width, height = self._target_width, self._target_height
+        scale = self._target_height / height
+        new_width = max(1, int(round(width * scale)))
+        if new_width > self._target_width:
+            new_width = self._target_width
+        resized = normalized.resize((new_width, self._target_height), Image.BICUBIC)
+        if self._channels == 1:
+            canvas = Image.new("L", (self._target_width, self._target_height), color=255)
+        else:
+            canvas = Image.new("RGB", (self._target_width, self._target_height), color=(255, 255, 255))
+        canvas.paste(resized, (0, 0))
+        array = np.asarray(canvas, dtype=np.float32)
+        if self._channels == 1:
+            array = array[np.newaxis, :, :]
+        else:
+            array = np.transpose(array, (2, 0, 1))  # HWC -> CHW
+        array = array / 255.0
+        array = array[np.newaxis, ...]  # add batch dimension
+        return array
 
     def _decode(self, logits: np.ndarray) -> str:
         if logits.ndim == 3:
@@ -264,8 +274,6 @@ def _get_pipeline() -> Optional[OpenVINOTextRecognizer]:
     return _PIPELINE
 
 
-
-
 def extract_text(image) -> str:
     """Extract text from the given image using the OpenVINO recognizer."""
 
@@ -276,14 +284,14 @@ def extract_text(image) -> str:
         pil_image = image
     else:
         pil_image = Image.fromarray(np.asarray(image))
-    pil_image = ImageOps.autocontrast(pil_image)
+    pil_image = _normalize_grayscale(pil_image)
     segments = _segment_text_lines(pil_image)
     if not segments:
         segments = [pil_image]
     decoded_lines: list[str] = []
     for idx, segment in enumerate(segments):
         try:
-            text_line = pipeline.run(ImageOps.autocontrast(segment))
+            text_line = pipeline.run(segment)
         except Exception as exc:  # pragma: no cover - runtime safeguard
             logger.debug("OpenVINO OCR inference failed on segment %s: %s", idx, exc)
             continue
@@ -294,7 +302,7 @@ def extract_text(image) -> str:
             print(f"[OCR DEBUG] line {idx}: {text_line}")
     if not decoded_lines:
         try:
-            fallback = pipeline.run(ImageOps.autocontrast(pil_image))
+            fallback = pipeline.run(pil_image)
         except Exception as exc:  # pragma: no cover - runtime safeguard
             logger.debug("OpenVINO OCR fallback failed: %s", exc)
             fallback = ""
@@ -310,11 +318,11 @@ _DEF_LINE_MARGIN = 4
 
 
 def _segment_text_lines(image: "Image.Image") -> list["Image.Image"]:
-    gray = np.asarray(ImageOps.autocontrast(image.convert("L")), dtype=np.float32)
+    gray_img = _normalize_grayscale(image)
+    gray = np.asarray(gray_img, dtype=np.float32)
     if gray.size == 0:
         return []
-    inverted = 255.0 - gray
-    row_profile = inverted.mean(axis=1)
+    row_profile = gray.mean(axis=1)
     if not np.any(row_profile):
         return []
     threshold = max(row_profile.mean() * 0.5, row_profile.max() * 0.15)
@@ -341,11 +349,11 @@ def _segment_text_lines(image: "Image.Image") -> list["Image.Image"]:
 
 
 def _trim_horizontal_margins(image: "Image.Image") -> "Image.Image":
-    gray = np.asarray(ImageOps.autocontrast(image.convert("L")), dtype=np.float32)
+    gray_img = _normalize_grayscale(image)
+    gray = np.asarray(gray_img, dtype=np.float32)
     if gray.size == 0:
         return image
-    inverted = 255.0 - gray
-    col_profile = inverted.mean(axis=0)
+    col_profile = gray.mean(axis=0)
     if not np.any(col_profile):
         return image
     threshold = max(col_profile.mean() * 0.5, col_profile.max() * 0.15)
@@ -384,4 +392,3 @@ def summarize_text(text: str, *, max_sentences: int = 2, max_chars: int = 200) -
     if len(summary) > max_chars:
         summary = summary[: max_chars - 1].rstrip() + "..."
     return summary
-

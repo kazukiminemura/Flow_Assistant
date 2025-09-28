@@ -1,0 +1,13 @@
+﻿# Core numeric support for images and segment heuristics
+numpy>=1.23
+
+# Pillow provides ImageGrab/ImageOps utilities used for captures and preprocessing
+Pillow>=10.0
+
+# OpenVINO runtime (and dev tools for omz_downloader) drive the OCR pipeline
+openvino>=2024.1
+openvino-dev>=2024.1
+
+# Optional but recommended: window/process inspection and fast screen capture
+psutil>=5.9
+mss>=9.0
