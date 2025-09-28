@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Deque, Iterable, Iterator
 
 from .models import ContextSnapshot
@@ -50,10 +51,19 @@ def snapshot_from_dict(payload: dict) -> ContextSnapshot:
         ts = ts_raw
     else:
         ts = datetime.utcnow()
+    screenshot_raw = payload.get("screenshot_path")
+    screenshot_path = None
+    if isinstance(screenshot_raw, Path):
+        screenshot_path = screenshot_raw
+    elif isinstance(screenshot_raw, str) and screenshot_raw:
+        screenshot_path = Path(screenshot_raw)
+    elif screenshot_raw is not None:
+        screenshot_path = Path(str(screenshot_raw))
     return ContextSnapshot(
         ts=ts,
         app=payload.get("app", "Unknown"),
         window_title=payload.get("window_title", ""),
         selected_text=payload.get("selected_text", ""),
         participants=list(payload.get("participants", [])),
+        screenshot_path=screenshot_path,
     )

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
 
@@ -28,6 +29,7 @@ class ContextSnapshot:
     window_title: str
     selected_text: str = ""
     participants: List[str] = field(default_factory=list)
+    screenshot_path: Optional[Path] = None
 
 
 @dataclass(slots=True)

@@ -48,6 +48,8 @@ class FlowAssistant:
         sources_map: Dict[str, List[Document]] = {}
         for suggestion in suggestions:
             self.learning.adjust_score(suggestion)
+            if snapshot.screenshot_path:
+                suggestion.metadata.setdefault("context_screenshot", str(snapshot.screenshot_path))
             context_text = self._context_text(snapshot)
             documents = self.rag.retrieve_support(suggestion, context_text=context_text)
             existing_sources = set(suggestion.sources)
@@ -61,6 +63,7 @@ class FlowAssistant:
             suggestions,
             context_preview=context_preview,
             sources_map=sources_map,
+            screenshot_path=snapshot.screenshot_path,
         )
         return cards
 
