@@ -1,9 +1,10 @@
-"""Live Flow Assistant monitor using active window context."""
+﻿"""Live Flow Assistant monitor using active window context."""
 
 from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 import time
 from datetime import datetime, timezone
@@ -21,6 +22,10 @@ except ModuleNotFoundError:  # pragma: no cover - optional dependency
     ImageGrab = None  # type: ignore
 
 logger = logging.getLogger(__name__)
+
+CAPTURE_SCREEN_ENABLED = os.getenv('FLOW_ASSISTANT_CAPTURE_SCREEN', '').strip().lower() in {'1', 'true', 'yes'}
+CAPTURE_SCREEN_DIR = Path(os.getenv('FLOW_ASSISTANT_CAPTURE_DIR', 'captures')).expanduser()
+CAPTURE_SCREEN_PREFIX = os.getenv('FLOW_ASSISTANT_CAPTURE_PREFIX', 'capture')
 
 
 def load_requirement_text() -> str:
@@ -40,14 +45,19 @@ def ingest_requirements(assistant: FlowAssistant) -> None:
         )
 
 
-def build_snapshot(info: ActiveWindowInfo, *, recognized_text: str = "") -> ContextSnapshot:
+def build_snapshot(
+    info: ActiveWindowInfo,
+    *,
+    recognized_text: str = "",
+    screenshot_path: Path | None = None,
+) -> ContextSnapshot:
     return ContextSnapshot(
         ts=info.timestamp,
         app=info.app_label,
         window_title=info.title,
         selected_text=recognized_text,
         participants=[],
-        screenshot_path=None,
+        screenshot_path=screenshot_path,
     )
 
 
@@ -72,6 +82,27 @@ def capture_window_image(info: ActiveWindowInfo):
         return None
 
 
+
+
+def save_capture_image(image, info: ActiveWindowInfo) -> Path | None:
+    if not CAPTURE_SCREEN_ENABLED or image is None:
+        return None
+    try:
+        capture_dir = CAPTURE_SCREEN_DIR
+        capture_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        logger.debug("Unable to prepare capture directory: %s", exc)
+        return None
+    timestamp = info.timestamp.astimezone().strftime("%Y%m%d_%H%M%S_%f")
+    safe_title = ''.join(ch if ch.isalnum() else '_' for ch in info.title)[:40]
+    filename = f"{CAPTURE_SCREEN_PREFIX}_{timestamp}" + (f"_{safe_title}" if safe_title else "") + ".png"
+    destination = capture_dir / filename
+    try:
+        image.save(destination, format='PNG')
+        return destination
+    except Exception as exc:
+        logger.debug("Failed to save capture image: %s", exc)
+        return None
 
 
 
@@ -125,20 +156,38 @@ def monitor_loop(*, interval: float, print_no_change: bool) -> None:
             print(f"[{timestamp_local}] {info.app_label} -> {info.title}")
             if info.process_path:
                 print(f"  path: {info.process_path}")
+
             window_image = capture_window_image(info)
-            recognized_text = ""
+            fullscreen_image = None
+            if ImageGrab is not None:
+                try:
+                    fullscreen_image = ImageGrab.grab()
+                except Exception as exc:  # pragma: no cover - runtime safeguard
+                    logger.debug('Fullscreen capture failed: %s', exc)
+            image_used = window_image or fullscreen_image
+            capture_path = save_capture_image(image_used, info) if image_used is not None else None
+            recognized_text = ''
             ocr_summary: Optional[str] = None
-            if window_image is not None:
-                recognized_text = extract_text(window_image)
+            if image_used is not None:
+                recognized_text = extract_text(image_used)
                 if recognized_text:
                     ocr_summary = summarize_text(recognized_text)
-            snapshot = build_snapshot(info, recognized_text=recognized_text)
+                elif window_image is None and fullscreen_image is not None:
+                    logger.debug('OCR produced empty text on fullscreen capture')
+            else:
+                logger.debug('Screenshot capture failed; skipping OCR')
+            snapshot = build_snapshot(
+                info,
+                recognized_text=recognized_text,
+                screenshot_path=capture_path,
+            )
             cards = assistant.observe(snapshot)
             card_list = list(cards) if not isinstance(cards, list) else cards
-            print(f"  summary: {summarize_context(info, card_list, ocr_summary=ocr_summary)}")
             if recognized_text:
-                trimmed = recognized_text if len(recognized_text) <= 200 else recognized_text[:197].rstrip() + "…"
+                trimmed = recognized_text if len(recognized_text) <= 200 else recognized_text[:197].rstrip() + "..."
                 print(f"  ocr-text: {trimmed}")
+            else:
+                print("  ocr-text: (empty)")
             if ocr_summary:
                 print(f"  ocr-summary: {ocr_summary}")
             rendered_cards = render_cards(card_list)
@@ -174,3 +223,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

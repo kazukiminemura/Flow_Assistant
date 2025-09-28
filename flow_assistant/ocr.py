@@ -21,7 +21,7 @@ except ModuleNotFoundError:  # pragma: no cover - optional dependency
     ov = None  # type: ignore
 
 try:  # pragma: no cover - optional dependency
-    from PIL import Image  # type: ignore
+    from PIL import Image, ImageOps  # type: ignore
 except ModuleNotFoundError:  # pragma: no cover - optional dependency
     Image = None  # type: ignore
 
@@ -135,20 +135,30 @@ class OpenVINOTextRecognizer:
         logits = outputs[self._output]
         return self._decode(logits).strip()
 
-    def _prepare_input(self, image: "Image.Image") -> np.ndarray:
-        if self._channels == 1:
-            image = image.convert("L")
-        else:
-            image = image.convert("RGB")
-        resized = image.resize((self._target_width, self._target_height))
-        array = np.asarray(resized, dtype=np.float32)
-        if self._channels == 1:
-            array = array[np.newaxis, :, :]
-        else:
-            array = np.transpose(array, (2, 0, 1))  # HWC -> CHW
-        array = array / 255.0
-        array = array[np.newaxis, ...]  # add batch dimension
-        return array
+
+def _prepare_input(self, image: "Image.Image") -> np.ndarray:
+    image = image.convert("L") if self._channels == 1 else image.convert("RGB")
+    width, height = image.size
+    if width == 0 or height == 0:
+        width, height = self._target_width, self._target_height
+    scale = self._target_height / height
+    new_width = max(1, int(round(width * scale)))
+    if new_width > self._target_width:
+        new_width = self._target_width
+    resized = image.resize((new_width, self._target_height), Image.BICUBIC)
+    if self._channels == 1:
+        canvas = Image.new("L", (self._target_width, self._target_height), color=255)
+    else:
+        canvas = Image.new("RGB", (self._target_width, self._target_height), color=(255, 255, 255))
+    canvas.paste(resized, (0, 0))
+    array = np.asarray(canvas, dtype=np.float32)
+    if self._channels == 1:
+        array = array[np.newaxis, :, :]
+    else:
+        array = np.transpose(array, (2, 0, 1))  # HWC -> CHW
+    array = array / 255.0
+    array = array[np.newaxis, ...]  # add batch dimension
+    return array
 
     def _decode(self, logits: np.ndarray) -> str:
         if logits.ndim == 3:
@@ -254,23 +264,101 @@ def _get_pipeline() -> Optional[OpenVINOTextRecognizer]:
     return _PIPELINE
 
 
+
+
 def extract_text(image) -> str:
     """Extract text from the given image using the OpenVINO recognizer."""
 
     pipeline = _get_pipeline()
-    if pipeline is None:
+    if pipeline is None or Image is None:
         return ""
-    try:
-        text = pipeline.run(image)
+    if isinstance(image, Image.Image):
+        pil_image = image
+    else:
+        pil_image = Image.fromarray(np.asarray(image))
+    pil_image = ImageOps.autocontrast(pil_image)
+    segments = _segment_text_lines(pil_image)
+    if not segments:
+        segments = [pil_image]
+    decoded_lines: list[str] = []
+    for idx, segment in enumerate(segments):
+        try:
+            text_line = pipeline.run(ImageOps.autocontrast(segment))
+        except Exception as exc:  # pragma: no cover - runtime safeguard
+            logger.debug("OpenVINO OCR inference failed on segment %s: %s", idx, exc)
+            continue
+        if not text_line:
+            continue
+        decoded_lines.append(text_line)
         if _DEBUG_OCR_OUTPUT:
-            separator = "-" * 40
-            print("[OCR DEBUG]", separator)
-            print(text)
-            print(separator)
-        return text
-    except Exception as exc:  # pragma: no cover - runtime safeguard
-        logger.debug("OpenVINO OCR inference failed: %s", exc)
-        return ""
+            print(f"[OCR DEBUG] line {idx}: {text_line}")
+    if not decoded_lines:
+        try:
+            fallback = pipeline.run(ImageOps.autocontrast(pil_image))
+        except Exception as exc:  # pragma: no cover - runtime safeguard
+            logger.debug("OpenVINO OCR fallback failed: %s", exc)
+            fallback = ""
+        if fallback:
+            decoded_lines.append(fallback)
+    if _DEBUG_OCR_OUTPUT and not decoded_lines:
+        print("[OCR DEBUG] no text detected")
+    return "\n".join(decoded_lines)
+
+
+_DEF_MIN_LINE_HEIGHT = 12
+_DEF_LINE_MARGIN = 4
+
+
+def _segment_text_lines(image: "Image.Image") -> list["Image.Image"]:
+    gray = np.asarray(ImageOps.autocontrast(image.convert("L")), dtype=np.float32)
+    if gray.size == 0:
+        return []
+    inverted = 255.0 - gray
+    row_profile = inverted.mean(axis=1)
+    if not np.any(row_profile):
+        return []
+    threshold = max(row_profile.mean() * 0.5, row_profile.max() * 0.15)
+    mask = row_profile > threshold
+    min_height = max(int(gray.shape[0] * 0.04), _DEF_MIN_LINE_HEIGHT)
+    margin = max(int(gray.shape[0] * 0.02), _DEF_LINE_MARGIN)
+    segments: list[Image.Image] = []
+    start = None
+    for idx, val in enumerate(mask):
+        if val and start is None:
+            start = idx
+        elif not val and start is not None:
+            if idx - start >= min_height:
+                top = max(0, start - margin)
+                bottom = min(gray.shape[0], idx + margin)
+                segments.append(_trim_horizontal_margins(image.crop((0, top, image.width, bottom))))
+            start = None
+    if start is not None and len(mask) - start >= min_height:
+        top = max(0, start - margin)
+        bottom = len(mask)
+        segments.append(_trim_horizontal_margins(image.crop((0, top, image.width, bottom))))
+    filtered = [seg for seg in segments if seg.height >= max(min_height // 2, 8) and seg.width > 8]
+    return filtered
+
+
+def _trim_horizontal_margins(image: "Image.Image") -> "Image.Image":
+    gray = np.asarray(ImageOps.autocontrast(image.convert("L")), dtype=np.float32)
+    if gray.size == 0:
+        return image
+    inverted = 255.0 - gray
+    col_profile = inverted.mean(axis=0)
+    if not np.any(col_profile):
+        return image
+    threshold = max(col_profile.mean() * 0.5, col_profile.max() * 0.15)
+    mask = col_profile > threshold
+    if not np.any(mask):
+        return image
+    indices = np.where(mask)[0]
+    margin = max(int(image.width * 0.02), 2)
+    left = max(0, int(indices[0]) - margin)
+    right = min(image.width, int(indices[-1]) + margin + 1)
+    if right - left < 8:
+        return image
+    return image.crop((left, 0, right, image.height))
 
 
 _SENTENCE_BOUNDARY = re.compile(r"(?<=[\u3002\uFF0E\uFF01\uFF1F.!?])\s+")
@@ -296,3 +384,4 @@ def summarize_text(text: str, *, max_sentences: int = 2, max_chars: int = 200) -
     if len(summary) > max_chars:
         summary = summary[: max_chars - 1].rstrip() + "..."
     return summary
+
